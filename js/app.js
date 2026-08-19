@@ -20,6 +20,36 @@
   let sideTab = 'case';   // case | schema | notes
   let activeStageIx = {}; // caseId -> index (session only)
   let lastRun = null;     // {ms, rows}
+  let completionState = null; // active autocomplete widget
+  let erdSvgCache = { detailed: '', compact: '' };
+  let erdView = null;
+  let erdCompactMode = false;
+  let erdDrag = null;
+  let erdHandlersBound = false;
+  let erdOverlay = null;
+
+  const SQL_KEYWORDS = [
+    'SELECT', 'FROM', 'WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'ON',
+    'GROUP BY', 'ORDER BY', 'HAVING', 'LIMIT', 'OFFSET', 'DISTINCT', 'AS',
+    'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL', 'LIKE', 'BETWEEN', 'COUNT',
+    'SUM', 'AVG', 'MIN', 'MAX', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
+    'UNION', 'ALL', 'WITH', 'INSERT', 'UPDATE', 'DELETE'
+  ];
+
+  const SCHEMA_INFO = (function buildSchemaInfo() {
+    const tables = {};
+    const tableNames = [];
+    WORLD.TABLES.forEach((table) => {
+      const columns = table.columns.map((col) => col[0]);
+      tables[table.name] = {
+        name: table.name,
+        columns: columns,
+        columnsLower: columns.map((col) => col.toLowerCase()),
+      };
+      tableNames.push(table.name);
+    });
+    return { tables, tableNames };
+  })();
 
   /* ------------------------------------------------------------------ utils */
 
@@ -163,7 +193,388 @@
   }
 
   function destroyEditor() {
+    closeAutocomplete();
+    erdDrag = null;
+    closeErdFullscreen(true);
+    erdView = null;
     if (cm) { try { cm.toTextArea(); } catch (e) {} cm = null; }
+  }
+
+  function erdName(name) {
+    return String(name || '').replace(/[^A-Za-z0-9_]/g, '_').toUpperCase();
+  }
+
+  function getErdRelationships() {
+    const relationships = [];
+    WORLD.TABLES.forEach((table) => {
+      table.columns.forEach((col) => {
+        const kind = col[2] || '';
+        if (kind.indexOf('fk:') !== 0) return;
+        const targetTable = kind.slice(3).split('.')[0];
+        relationships.push({
+          sourceTable: targetTable,
+          targetTable: table.name,
+          column: col[0],
+        });
+      });
+    });
+    return relationships;
+  }
+
+  function buildErdDefinition(compact) {
+    const lines = ['erDiagram'];
+
+    WORLD.TABLES.forEach((table) => {
+      lines.push('  ' + erdName(table.name) + ' {');
+      table.columns.forEach((col) => {
+        const kind = col[2] || '';
+        const isPk = kind === 'pk';
+        const isFk = kind.indexOf('fk:') === 0;
+        if (compact && !isPk && !isFk) return;
+        const tags = [];
+        if (isPk) tags.push('PK');
+        if (isFk) tags.push('FK');
+        lines.push('    ' + col[1] + ' ' + col[0] + (tags.length ? ' ' + tags.join(', ') : ''));
+      });
+      lines.push('  }');
+    });
+
+    getErdRelationships().forEach((rel) => {
+      lines.push('  ' + erdName(rel.sourceTable) + ' ||--o{ ' + erdName(rel.targetTable) + ' : ' + rel.column);
+    });
+
+    return lines.join('\n');
+  }
+
+  function ensureErdRenderer() {
+    if (!globalThis.mermaid || ensureErdRenderer._ready) return !!globalThis.mermaid;
+    globalThis.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: 'base',
+      themeVariables: {
+        background: '#f3ecdf',
+        mainBkg: '#efe4d1',
+        primaryColor: '#efe4d1',
+        primaryBorderColor: '#8a6a2c',
+        primaryTextColor: '#241d14',
+        lineColor: '#8a6a2c',
+        tertiaryColor: '#f8f2e7',
+        secondaryColor: '#e5d5ba',
+        secondaryBorderColor: '#9a7a3a',
+        tertiaryTextColor: '#342b1f',
+        edgeLabelBackground: '#fbf7ef',
+        fontFamily: 'Iowan Old Style, Palatino Linotype, Palatino, Georgia, serif',
+      },
+      er: {
+        layoutDirection: 'LR',
+        useMaxWidth: false,
+        diagramPadding: 8,
+        minEntityWidth: 140,
+        minEntityHeight: 44,
+        entityPadding: 8,
+        nodeSpacing: 60,
+        rankSpacing: 60,
+        fontSize: 13,
+      },
+      flowchart: { useMaxWidth: false },
+    });
+    ensureErdRenderer._ready = true;
+    return true;
+  }
+
+  function getErdCacheKey() {
+    return erdCompactMode ? 'compact' : 'detailed';
+  }
+
+  function getErdPanel() {
+    return $('#erd-panel-shell');
+  }
+
+  function isErdFullscreen() {
+    return !!(erdOverlay && erdOverlay.parentNode);
+  }
+
+  function getErdNodeEl(svg, tableName) {
+    return svg.querySelector('[id^="entity-' + CSS.escape(erdName(tableName)) + '-"]');
+  }
+
+  function setErdStatus(text) {
+    const box = $('#erd-status');
+    if (box) box.textContent = text || '';
+  }
+
+  function clearErdHighlight() {
+    if (!erdView || !erdView.svg) return;
+    $$('.is-source, .is-target, .is-active, .is-faded', erdView.svg).forEach((el) => {
+      el.classList.remove('is-source', 'is-target', 'is-active', 'is-faded');
+    });
+    setErdStatus(erdCompactMode
+      ? 'Compact view · keys and joins only'
+      : 'Detailed view · all fields and datatypes');
+  }
+
+  function applyErdViewBox() {
+    if (!erdView || !erdView.svg) return;
+    const vb = erdView.viewBox;
+    erdView.svg.setAttribute('viewBox', [vb.x, vb.y, vb.w, vb.h].join(' '));
+  }
+
+  function setErdViewBox(next) {
+    if (!erdView) return;
+    erdView.viewBox = next;
+    applyErdViewBox();
+  }
+
+  function fitErdToBox(box, paddingFactor) {
+    if (!erdView || !box) return;
+    const pad = Math.max(18, ((paddingFactor || 0.12) * Math.max(box.width, box.height)));
+    setErdViewBox({
+      x: box.x - pad,
+      y: box.y - pad,
+      w: box.width + pad * 2,
+      h: box.height + pad * 2,
+    });
+  }
+
+  function fitErd() {
+    if (!erdView) return;
+    fitErdToBox(erdView.baseBox, 0.04);
+  }
+
+  function zoomErd(factor) {
+    if (!erdView) return;
+    const current = erdView.viewBox;
+    const nextW = Math.max(erdView.baseBox.width * 0.28, Math.min(erdView.baseBox.width * 2.4, current.w * factor));
+    const nextH = Math.max(erdView.baseBox.height * 0.28, Math.min(erdView.baseBox.height * 2.4, current.h * factor));
+    setErdViewBox({
+      x: current.x + (current.w - nextW) / 2,
+      y: current.y + (current.h - nextH) / 2,
+      w: nextW,
+      h: nextH,
+    });
+  }
+
+  function bindErdControls() {
+    if ($('#erd-zoom-in')) $('#erd-zoom-in').onclick = () => zoomErd(0.82);
+    if ($('#erd-zoom-out')) $('#erd-zoom-out').onclick = () => zoomErd(1.22);
+    if ($('#erd-fit')) $('#erd-fit').onclick = fitErd;
+    if ($('#erd-reset')) $('#erd-reset').onclick = () => {
+      clearErdHighlight();
+      fitErd();
+    };
+    if ($('#erd-mode')) {
+      $('#erd-mode').textContent = erdCompactMode ? 'Show details' : 'Compact';
+      $('#erd-mode').onclick = () => {
+        erdCompactMode = !erdCompactMode;
+        erdView = null;
+        renderErd(true);
+      };
+    }
+    if ($('#erd-expand')) {
+      $('#erd-expand').textContent = isErdFullscreen() ? 'Collapse' : 'Expand';
+      $('#erd-expand').onclick = () => {
+        if (isErdFullscreen()) closeErdFullscreen();
+        else openErdFullscreen();
+      };
+    }
+  }
+
+  function ensureErdOverlay() {
+    if (erdOverlay) return erdOverlay;
+    erdOverlay = document.createElement('div');
+    erdOverlay.className = 'erd-overlay';
+    erdOverlay.innerHTML =
+      '<div class="erd-overlay__dialog">' +
+      '<div class="erd-overlay__top">' +
+      '<div class="erd-overlay__title">Entity Map</div>' +
+      '<button class="btn ghost small" id="erd-close">Exit</button>' +
+      '</div>' +
+      '<div class="erd-overlay__body" id="erd-overlay-body"></div>' +
+      '</div>';
+    return erdOverlay;
+  }
+
+  function openErdFullscreen() {
+    const panel = getErdPanel();
+    if (!panel || isErdFullscreen()) return;
+    const overlay = ensureErdOverlay();
+    document.body.appendChild(overlay);
+    $('#erd-overlay-body', overlay).appendChild(panel);
+    panel.classList.add('is-fullscreen');
+    $('#erd-close', overlay).onclick = () => closeErdFullscreen();
+    overlay.onclick = (e) => { if (e.target === overlay) closeErdFullscreen(); };
+    bindErdControls();
+    if (getErdPanel()) setupErdViewport($('#erd-diagram'));
+  }
+
+  function closeErdFullscreen(silent) {
+    const panel = getErdPanel();
+    const home = $('#erd-panel-home');
+    if (!isErdFullscreen()) return;
+    if (panel && home) {
+      home.appendChild(panel);
+      panel.classList.remove('is-fullscreen');
+    }
+    if (erdOverlay && erdOverlay.parentNode) erdOverlay.parentNode.removeChild(erdOverlay);
+    if (!silent) bindErdControls();
+    if (getErdPanel()) setupErdViewport($('#erd-diagram'));
+  }
+
+  function normalizeErdMarkers(svg) {
+    $$('marker', svg).forEach((marker) => {
+      marker.setAttribute('markerUnits', 'strokeWidth');
+      marker.setAttribute('markerWidth', '10');
+      marker.setAttribute('markerHeight', '10');
+      marker.setAttribute('refY', '7');
+      marker.setAttribute('orient', 'auto');
+      marker.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+      marker.style.overflow = 'visible';
+      $$('circle, path, line, polyline', marker).forEach((shape) => {
+        shape.classList.add('erd-marker-shape');
+        shape.setAttribute('vector-effect', 'non-scaling-stroke');
+        shape.setAttribute('stroke-linecap', 'round');
+        shape.setAttribute('stroke-linejoin', 'round');
+      });
+    });
+  }
+
+  function focusErdRelation(sourceEl, targetEl) {
+    if (!sourceEl || !targetEl || !erdView) return;
+    const a = sourceEl.getBBox();
+    const b = targetEl.getBBox();
+    const box = {
+      x: Math.min(a.x, b.x),
+      y: Math.min(a.y, b.y),
+      width: Math.max(a.x + a.width, b.x + b.width) - Math.min(a.x, b.x),
+      height: Math.max(a.y + a.height, b.y + b.height) - Math.min(a.y, b.y),
+    };
+    fitErdToBox(box, 0.18);
+  }
+
+  function wireErdInteraction(svg) {
+    const frame = $('#erd-stage');
+    if (!frame) return;
+
+    const relationships = getErdRelationships();
+    const edges = $$('.relationshipLine', svg);
+    edges.forEach((edge, index) => {
+      const rel = relationships[index];
+      if (!rel) return;
+      edge.classList.add('is-clickable');
+      edge.dataset.sourceTable = rel.sourceTable;
+      edge.dataset.targetTable = rel.targetTable;
+      edge.dataset.column = rel.column;
+      edge.onclick = () => {
+        clearErdHighlight();
+        const sourceEl = getErdNodeEl(svg, rel.sourceTable);
+        const targetEl = getErdNodeEl(svg, rel.targetTable);
+        if (!sourceEl || !targetEl) return;
+        edge.classList.add('is-active');
+        sourceEl.classList.add('is-source');
+        targetEl.classList.add('is-target');
+
+        $$('.node', svg).forEach((node) => {
+          if (node !== sourceEl && node !== targetEl) node.classList.add('is-faded');
+        });
+        edges.forEach((line) => {
+          if (line !== edge) line.classList.add('is-faded');
+        });
+
+        setErdStatus(rel.targetTable + '.' + rel.column + ' points to ' + rel.sourceTable);
+        focusErdRelation(sourceEl, targetEl);
+      };
+    });
+
+    frame.onmousedown = (e) => {
+      if (!erdView || e.target.closest('.relationshipLine')) return;
+      erdDrag = { x: e.clientX, y: e.clientY };
+      frame.classList.add('is-dragging');
+    };
+    frame.onwheel = (e) => {
+      e.preventDefault();
+      zoomErd(e.deltaY < 0 ? 0.9 : 1.1);
+    };
+
+    if (!erdHandlersBound) {
+      window.addEventListener('mousemove', (e) => {
+        const activeFrame = $('#erd-stage');
+        if (!erdDrag || !erdView || !activeFrame) return;
+        const dx = e.clientX - erdDrag.x;
+        const dy = e.clientY - erdDrag.y;
+        erdDrag = { x: e.clientX, y: e.clientY };
+        const vb = erdView.viewBox;
+        const scaleX = vb.w / Math.max(1, activeFrame.clientWidth);
+        const scaleY = vb.h / Math.max(1, activeFrame.clientHeight);
+        setErdViewBox({
+          x: vb.x - dx * scaleX,
+          y: vb.y - dy * scaleY,
+          w: vb.w,
+          h: vb.h,
+        });
+      });
+      window.addEventListener('mouseup', () => {
+        erdDrag = null;
+        const activeFrame = $('#erd-stage');
+        if (activeFrame) activeFrame.classList.remove('is-dragging');
+      });
+      erdHandlersBound = true;
+    }
+  }
+
+  function setupErdViewport(mount) {
+    const svg = $('svg', mount);
+    const root = svg && $('g', svg);
+    if (!svg || !root || !root.getBBox) return;
+    normalizeErdMarkers(svg);
+    const box = root.getBBox();
+    erdView = {
+      svg: svg,
+      baseBox: {
+        x: box.x,
+        y: box.y,
+        width: Math.max(1, box.width),
+        height: Math.max(1, box.height),
+      },
+      viewBox: null,
+    };
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+    fitErd();
+    clearErdHighlight();
+    wireErdInteraction(svg);
+    bindErdControls();
+  }
+
+  function renderErd(force) {
+    const mount = $('#erd-diagram');
+    if (!mount) return;
+    bindErdControls();
+
+    const cacheKey = getErdCacheKey();
+    if (!force && erdSvgCache[cacheKey]) {
+      mount.innerHTML = erdSvgCache[cacheKey];
+      setupErdViewport(mount);
+      return;
+    }
+
+    if (!ensureErdRenderer()) {
+      mount.innerHTML = '<div class="erd-empty">ER diagram library failed to load.</div>';
+      return;
+    }
+
+    mount.innerHTML = '<div class="erd-empty">Drawing entity map…</div>';
+    const renderId = 'nullport-erd-' + Date.now();
+
+    globalThis.mermaid.render(renderId, buildErdDefinition(erdCompactMode)).then((result) => {
+      if (!$('#erd-diagram')) return;
+      erdSvgCache[cacheKey] = result.svg;
+      mount.innerHTML = result.svg;
+      if (result.bindFunctions) result.bindFunctions(mount);
+      setupErdViewport(mount);
+    }).catch((err) => {
+      mount.innerHTML = '<div class="erd-empty">Could not render the ER diagram.</div>';
+      console.error(err);
+    });
   }
 
   /* ------------------------------------------------------------- prologue */
@@ -318,7 +729,7 @@
     $('#back-board').onclick = () => go('board');
   }
 
-  /* ----------------------------------------------------- sidebar: schema */
+  /* ----------------------------------------------------- schema */
 
   function renderSchema(box) {
     const tables = WORLD.TABLES.map((t) => {
@@ -341,9 +752,13 @@
 
     box.innerHTML =
       '<div class="schema">' +
-      '<div class="schema-hint">Click a table to see its columns. <b>peek</b> runs a sample query; ' +
+      '<div class="schema-hint">' +
+      '<div class="schema-topline">' +
+      '<span>Click a table to see its columns. <b>peek</b> runs a sample query; ' +
       'clicking a column name drops it into the editor. Arrows show which column points at which table — ' +
-      'those are your <code>JOIN</code> conditions.</div>' + tables + '</div>';
+      'those are your <code>JOIN</code> conditions.</span>' +
+      '</div>' +
+      '</div>' + tables + '</div>';
 
     $$('.tbl', box).forEach((tb) => {
       $('.tbl-h', tb).onclick = (e) => {
@@ -358,6 +773,10 @@
       $$('.col', tb).forEach((cl) => {
         cl.onclick = () => insertAtCursor(cl.dataset.col);
       });
+    });
+
+    $$('.erd-col', box).forEach((cl) => {
+      cl.onclick = () => insertAtCursor(cl.dataset.col);
     });
   }
 
@@ -410,6 +829,34 @@
         if (b.t === 'note') return '<div class="note">' + b.v + '</div>';
         return '<p>' + b.v + '</p>';
       }).join('') + '</div></div>';
+
+    const erd =
+      '<div class="fold" id="erd-fold">' +
+      '<div class="fold-h"><span class="caret">▶</span>Entity map' +
+      '<span class="tag">PK · FK · data types</span></div>' +
+      '<div class="fold-b">' +
+      '<div id="erd-panel-home"><div class="erd-panel" id="erd-panel-shell">' +
+      '<div class="erd-copy">A cleaner relationship map of the whole city database. Click any join line to trace where it goes, use the controls to zoom or fit, and drag the canvas to inspect a cluster up close.</div>' +
+      '<div class="erd-toolbar">' +
+      '<div class="erd-legend">' +
+      '<span><b>PK</b> primary key</span>' +
+      '<span><b>FK</b> foreign key</span>' +
+      '<span id="erd-status">Detailed view · all fields and datatypes</span>' +
+      '</div>' +
+      '<div class="erd-actions">' +
+      '<button class="btn ghost small" id="erd-zoom-out">Zoom out</button>' +
+      '<button class="btn ghost small" id="erd-zoom-in">Zoom in</button>' +
+      '<button class="btn ghost small" id="erd-fit">Fit</button>' +
+      '<button class="btn ghost small" id="erd-reset">Clear focus</button>' +
+      '<button class="btn ghost small" id="erd-mode">Compact</button>' +
+      '<button class="btn ghost small" id="erd-expand">Expand</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="erd-frame" id="erd-stage"><div id="erd-diagram"></div></div>' +
+      '</div></div>' +
+      '</div>' +
+      '</div>' +
+      '</div>';
 
     const hintHtml = [];
     for (let i = 0; i < shown; i++) {
@@ -479,10 +926,14 @@
         '<button class="btn" id="to-board">All case files</button></div></div>'
       : '';
 
-    ws.innerHTML = primer + stageCard + revealHtml + completeHtml;
+    ws.innerHTML = primer + erd + stageCard + revealHtml + completeHtml;
 
     /* ---- wire up ---- */
     $('#primer').querySelector('.fold-h').onclick = () => $('#primer').classList.toggle('open');
+    $('#erd-fold').querySelector('.fold-h').onclick = () => {
+      $('#erd-fold').classList.toggle('open');
+      if ($('#erd-fold').classList.contains('open')) renderErd();
+    };
 
     cm = CodeMirror.fromTextArea($('#editor'), {
       mode: 'text/x-sql',
@@ -494,7 +945,35 @@
         'Ctrl-Enter': runQuery,
         'Cmd-Enter': runQuery,
         'Shift-Enter': runQuery,
+        'Ctrl-/': handleToggleSqlComment,
+        'Cmd-/': handleToggleSqlComment,
+        Tab: handleTabKey,
       },
+    });
+    cm.on('inputRead', handleEditorInputRead);
+    cm.on('cursorActivity', handleCursorActivity);
+    cm.on('blur', handleEditorBlur);
+    cm.on('keydown', (editor, e) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === '/' || e.key === '?')) {
+        e.preventDefault();
+        e.stopPropagation();
+        handleToggleSqlComment(editor);
+        return;
+      }
+      if (!completionState || completionState.editor !== editor) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        moveAutocompleteSelection(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveAutocompleteSelection(-1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        acceptAutocomplete();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeAutocomplete();
+      }
     });
     cm.setValue(sessionStorage.getItem('q.' + s.id) || s.starter || '');
     cm.on('change', () => {
@@ -544,9 +1023,244 @@
     cm.focus();
   }
 
+  function toggleSqlComment() {
+    const editor = this && this.getDoc ? this : cm;
+    if (!editor) return;
+
+    const selections = editor.listSelections();
+    editor.operation(() => {
+      selections.forEach((sel) => {
+        const from = sel.from();
+        const to = sel.to();
+        const startLine = Math.min(from.line, to.line);
+        const endLine = Math.max(from.line, to.line);
+        const lines = [];
+
+        for (let i = startLine; i <= endLine; i++) {
+          lines.push({ line: i, text: editor.getLine(i) || '' });
+        }
+
+        const allCommented = lines.every(({ text }) => text.trimStart().indexOf('--') === 0);
+
+        lines.forEach(({ line, text }) => {
+          const indent = text.match(/^\s*/)[0];
+          const body = text.slice(indent.length);
+          const replacement = allCommented
+            ? indent + body.replace(/^--\s?/, '')
+            : indent + '-- ' + body;
+          editor.replaceRange(replacement, { line, ch: 0 }, { line, ch: text.length });
+        });
+      });
+    });
+  }
+
+  function handleToggleSqlComment(editor) {
+    toggleSqlComment.call(editor || cm);
+  }
+
+  function handleTabKey(editor) {
+    if (completionState && completionState.editor === editor) {
+      acceptAutocomplete();
+      return;
+    }
+    editor.execCommand('defaultTab');
+  }
+
+  function handleEditorInputRead(editor, change) {
+    if (!change || change.origin === 'setValue' || change.origin === 'complete') return;
+    const typed = (change.text || []).join('');
+    if (!typed) {
+      closeAutocomplete();
+      return;
+    }
+    if (!/[A-Za-z0-9_.]/.test(typed)) {
+      closeAutocomplete();
+      return;
+    }
+    updateAutocomplete(editor);
+  }
+
+  function handleCursorActivity(editor) {
+    if (completionState && completionState.editor === editor) updateAutocomplete(editor, true);
+  }
+
+  function handleEditorBlur() {
+    setTimeout(closeAutocomplete, 120);
+  }
+
+  function getAliasMap(sql) {
+    const aliases = {};
+    const re = /\b(?:FROM|JOIN)\s+([A-Za-z_][\w]*)\s+(?:AS\s+)?([A-Za-z_][\w]*)/gi;
+    let match;
+    while ((match = re.exec(sql))) {
+      aliases[match[2].toLowerCase()] = match[1];
+    }
+    return aliases;
+  }
+
+  function getAutocompleteContext(editor) {
+    const cursor = editor.getCursor();
+    const token = editor.getTokenAt(cursor);
+    const tokenType = token && token.type ? token.type : '';
+    if (tokenType.indexOf('comment') !== -1 || tokenType.indexOf('string') !== -1) return null;
+
+    const line = editor.getLine(cursor.line);
+    const before = line.slice(0, cursor.ch);
+    const qualified = before.match(/([A-Za-z_][\w]*)\.([A-Za-z_]*)$/);
+    if (qualified) {
+      return {
+        from: { line: cursor.line, ch: before.length - qualified[2].length },
+        to: cursor,
+        prefix: qualified[2],
+        qualifier: qualified[1],
+      };
+    }
+
+    const plain = before.match(/([A-Za-z_][\w]*)$/);
+    if (!plain) return null;
+    return {
+      from: { line: cursor.line, ch: before.length - plain[1].length },
+      to: cursor,
+      prefix: plain[1],
+      qualifier: null,
+    };
+  }
+
+  function collectAutocompleteItems(editor, ctx) {
+    const prefixLower = ctx.prefix.toLowerCase();
+    const aliasMap = getAliasMap(editor.getValue());
+    const items = [];
+    const seen = {};
+
+    function pushItem(text, type, boost) {
+      const key = text.toLowerCase() + '|' + type;
+      if (seen[key]) return;
+      if (prefixLower && text.toLowerCase().indexOf(prefixLower) !== 0) return;
+      seen[key] = true;
+      items.push({ text, type, score: boost || 0 });
+    }
+
+    if (ctx.qualifier) {
+      const sourceName = aliasMap[ctx.qualifier.toLowerCase()] || ctx.qualifier;
+      const table = SCHEMA_INFO.tables[sourceName];
+      if (!table) return [];
+      table.columns.forEach((column) => pushItem(column, 'column', 30));
+      return items.sort(sortAutocompleteItems);
+    }
+
+    SCHEMA_INFO.tableNames.forEach((tableName) => pushItem(tableName, 'table', 20));
+    Object.keys(aliasMap).forEach((alias) => pushItem(alias, 'alias', 18));
+    WORLD.TABLES.forEach((table) => {
+      table.columns.forEach((col) => pushItem(col[0], 'column', 12));
+    });
+    SQL_KEYWORDS.forEach((keyword) => pushItem(keyword, 'keyword', 6));
+
+    return items.sort(sortAutocompleteItems);
+  }
+
+  function sortAutocompleteItems(a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.text.length !== b.text.length) return a.text.length - b.text.length;
+    return a.text.localeCompare(b.text);
+  }
+
+  function updateAutocomplete(editor, keepSelection) {
+    const ctx = getAutocompleteContext(editor);
+    if (!ctx || (!ctx.prefix && !ctx.qualifier)) {
+      closeAutocomplete();
+      return;
+    }
+
+    const items = collectAutocompleteItems(editor, ctx).slice(0, 9);
+    if (!items.length) {
+      closeAutocomplete();
+      return;
+    }
+
+    const existingIndex = keepSelection && completionState && completionState.editor === editor
+      ? completionState.selectedIndex
+      : 0;
+
+    if (!completionState || completionState.editor !== editor) {
+      openAutocomplete(editor, ctx, items, existingIndex);
+      return;
+    }
+
+    completionState.context = ctx;
+    completionState.items = items;
+    completionState.selectedIndex = Math.min(existingIndex, items.length - 1);
+    positionAutocomplete(editor);
+    renderAutocomplete();
+  }
+
+  function openAutocomplete(editor, ctx, items, selectedIndex) {
+    closeAutocomplete();
+    const menu = document.createElement('div');
+    menu.className = 'sql-complete';
+    menu.onmousedown = (e) => e.preventDefault();
+    document.body.appendChild(menu);
+    completionState = {
+      editor: editor,
+      context: ctx,
+      items: items,
+      selectedIndex: Math.max(0, selectedIndex || 0),
+      menu: menu,
+    };
+    positionAutocomplete(editor);
+    renderAutocomplete();
+  }
+
+  function positionAutocomplete(editor) {
+    if (!completionState || completionState.editor !== editor) return;
+    const coords = editor.cursorCoords(completionState.context.to, 'page');
+    completionState.menu.style.left = coords.left + 'px';
+    completionState.menu.style.top = (coords.bottom + 6) + 'px';
+  }
+
+  function renderAutocomplete() {
+    if (!completionState) return;
+    completionState.menu.innerHTML = completionState.items.map((item, index) =>
+      '<button class="sql-complete__item' + (index === completionState.selectedIndex ? ' is-selected' : '') +
+      '" data-ix="' + index + '">' +
+      '<span class="sql-complete__text">' + esc(item.text) + '</span>' +
+      '<span class="sql-complete__type">' + esc(item.type) + '</span>' +
+      '</button>'
+    ).join('');
+    $$('.sql-complete__item', completionState.menu).forEach((button) => {
+      button.onclick = () => {
+        completionState.selectedIndex = +button.dataset.ix;
+        acceptAutocomplete();
+      };
+    });
+  }
+
+  function moveAutocompleteSelection(step) {
+    if (!completionState) return;
+    const total = completionState.items.length;
+    completionState.selectedIndex = (completionState.selectedIndex + step + total) % total;
+    renderAutocomplete();
+  }
+
+  function acceptAutocomplete() {
+    if (!completionState) return;
+    const item = completionState.items[completionState.selectedIndex];
+    const editor = completionState.editor;
+    editor.replaceRange(item.text, completionState.context.from, completionState.context.to, 'complete');
+    closeAutocomplete();
+  }
+
+  function closeAutocomplete() {
+    if (!completionState) return;
+    if (completionState.menu && completionState.menu.parentNode) {
+      completionState.menu.parentNode.removeChild(completionState.menu);
+    }
+    completionState = null;
+  }
+
   function runQuery() {
     if (!cm || !DB) return;
-    const sql = cm.getValue().trim();
+    const selectedSql = cm.somethingSelected() ? cm.getSelection() : '';
+    const sql = (selectedSql || cm.getValue()).trim();
     const out = $('#results');
     const stat = $('#stat');
     if (!sql) { out.innerHTML = '<div class="res-empty">Nothing to run.</div>'; return; }
@@ -574,7 +1288,7 @@
     if (!res.length) {
       out.innerHTML = '<div class="results"><div class="res-head">Result</div>' +
         '<div class="res-empty">Statement executed. No rows returned.</div></div>';
-      if (stat) stat.textContent = ms.toFixed(0) + ' ms';
+      if (stat) stat.textContent = ms.toFixed(0) + ' ms' + (selectedSql.trim() ? ' · selection' : '');
       return;
     }
 
@@ -601,7 +1315,8 @@
       '</tr></thead><tbody>' + body + '</tbody></table></div></div>';
 
     lastRun = { ms, rows: set.values.length };
-    if (stat) stat.textContent = ms.toFixed(0) + ' ms · ' + set.values.length + ' rows';
+    if (stat) stat.textContent = ms.toFixed(0) + ' ms · ' + set.values.length + ' rows' +
+      (selectedSql.trim() ? ' · selection' : '');
   }
 
   /* -------------------------------------------------------- answer check */
