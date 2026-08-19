@@ -163,11 +163,19 @@ const pageErrors = [];
     /ms/.test(await evaluate("document.querySelector('#stat').textContent")));
   await shot('04-query-results');
 
+  console.log('\nEDITOR SHORTCUTS');
+  await evaluate("(function(){const cm=document.querySelector('.CodeMirror').CodeMirror; cm.setValue('SELECT *\\nFROM person;'); cm.setSelection({line:0,ch:0},{line:1,ch:0}); cm.execCommand('toggleComment'); return cm.getValue();})()");
+  check('toggleComment adds SQL comment markers',
+    (await evaluate("document.querySelector('.CodeMirror').CodeMirror.getValue()"))
+      .includes('--'));
+
   console.log('\nSCHEMA EXPLORER');
   await evaluate("document.querySelector('.side-tabs [data-tab=\"schema\"]').click()");
   await sleep(300);
   const tbls = await evaluate("document.querySelectorAll('.schema .tbl').length");
   check('all 18 tables listed', tbls === 18, 'got ' + tbls);
+  check('ER diagram is visible by default',
+    await evaluate("!!document.querySelector('.erd-panel')"));
   await evaluate("document.querySelector('.schema .tbl-h').click()");
   await sleep(200);
   check('table expands to show columns',
