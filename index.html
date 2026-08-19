@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nullport — A SQL Murder Mystery</title>
+<meta name="description" content="Eight connected cases. Learn SQL from SELECT to window functions by solving a conspiracy in a rain-soaked port city.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%230d0f11'/><text y='24' x='16' text-anchor='middle' font-size='22' fill='%23d9a441' font-family='Georgia,serif'>N</text></svg>">
+<link rel="stylesheet" href="vendor/codemirror.css">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ===================== boot ===================== -->
+<div id="boot">
+  <div class="boot-mark">Nullport</div>
+  <div class="boot-sub">Bureau Records Terminal</div>
+  <div class="boot-bar" id="boot-bar"><span style="right:100%"></span></div>
+  <div class="boot-log" id="boot-log">initialising</div>
+</div>
+
+<!-- ===================== app ====================== -->
+<div id="app">
+  <header class="topbar" id="topbar"></header>
+  <main id="view"></main>
+</div>
+
+<div id="toast"></div>
+
+<!-- vendor -->
+<script src="vendor/sql-asm.js"></script>
+<script src="vendor/codemirror.js"></script>
+<script src="vendor/codemirror-sql.js"></script>
+
+<!-- game -->
+<script src="js/world.js"></script>
+<script src="js/answer.js"></script>
+<script src="js/cases.js"></script>
+<script src="js/db.js"></script>
+<script src="js/app.js"></script>
+
+</body>
+</html>

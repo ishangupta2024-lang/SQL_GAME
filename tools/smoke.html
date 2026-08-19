@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>smoke: pending</title>
+</head>
+<body>
+<pre id="out">running…</pre>
+
+<script src="../vendor/sql-asm.js"></script>
+<script src="../js/world.js"></script>
+<script src="../js/answer.js"></script>
+<script src="../js/cases.js"></script>
+<script src="../js/db.js"></script>
+<script src="solutions.js"></script>
+<script>
+/* Browser-side smoke test.
+ * Proves the asm.js SQLite build, the world generator, the whole solution set
+ * and the answer hashing all work inside an actual browser — not just Node.
+ * Run headless and read the DOM (or open it in a browser and look). */
+(async function () {
+  const out = document.getElementById('out');
+  const lines = [];
+  let pass = 0, fail = 0;
+  const say = (s) => { lines.push(s); out.textContent = lines.join('\n'); };
+
+  window.onerror = (m, src, l, c) => {
+    say('UNCAUGHT: ' + m + ' @' + src + ':' + l + ':' + c);
+    document.title = 'smoke: FAIL';
+  };
+
+  try {
+    const t0 = performance.now();
+    const r = await globalThis.NullportDB.init(() => {});
+    const db = r.db;
+    const buildMs = Math.round(performance.now() - t0);
+    say('db ready (' + (r.cached ? 'restored from cache' : 'built fresh') + ')');
+    say('build+load: ' + buildMs + ' ms');
+
+    const scalar = (sql) => {
+      const r = db.exec(sql);
+      if (!r.length || !r[0].values.length) return null;
+      return r[0].values[0][0];
+    };
+
+    // Row counts prove the whole world made it in.
+    let total = 0;
+    globalThis.NullportWorld.TABLES.forEach((t) => {
+      total += scalar('SELECT COUNT(*) FROM ' + t.name);
+    });
+    say('total rows: ' + total);
+    if (total < 100000) { fail++; say('FAIL: suspiciously few rows'); } else pass++;
+
+    // Every stage, end to end.
+    const A = globalThis.NullportAnswer;
+    const SOL = globalThis.NullportSolutions;
+    globalThis.NullportCases.CASES.forEach((c) => {
+      c.stages.forEach((st) => {
+        let v = null, err = null;
+        const q0 = performance.now();
+        try { v = SOL.solve(st.id, scalar); } catch (e) { err = e.message; }
+        const qms = Math.round(performance.now() - q0);
+        if (err) { fail++; say('FAIL ' + st.id + ': ' + err); return; }
+        if (v === null) { fail++; say('FAIL ' + st.id + ': no result'); return; }
+        if (st.answers.indexOf(A.hash(v)) === -1) {
+          fail++; say('FAIL ' + st.id + ': "' + v + '" not accepted'); return;
+        }
+        pass++;
+        say('ok   ' + st.id + '  ' + String(qms).padStart(4) + 'ms  "' + v + '"');
+      });
+    });
+
+    // The starter query in every stage must at least parse and run.
+    globalThis.NullportCases.CASES.forEach((c) => {
+      c.stages.forEach((st) => {
+        const s = (st.starter || '').replace(/--.*$/gm, '').trim();
+        if (!s) return;
+        try { db.exec(s); pass++; }
+        catch (e) { fail++; say('FAIL starter ' + st.id + ': ' + e.message); }
+      });
+    });
+    say('starter queries all parse');
+
+    say('');
+    say(pass + ' passed, ' + fail + ' failed');
+    document.title = 'smoke: ' + (fail ? 'FAIL' : 'PASS') + ' ' + pass + '/' + (pass + fail);
+    say('RESULT=' + (fail ? 'FAIL' : 'PASS'));
+  } catch (e) {
+    say('FATAL: ' + (e && e.stack ? e.stack : e));
+    document.title = 'smoke: FAIL';
+    say('RESULT=FAIL');
+  }
+})();
+</script>
+</body>
+</html>

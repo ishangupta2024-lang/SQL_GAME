@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:mystery.knightlab.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sL -o /dev/null -w \"%{http_code}\\\\n\" https://raw.githubusercontent.com/NUKnightLab/sql-mysteries/main/walkthrough.html)",
+      "Bash(curl -sL \"https://api.github.com/repos/NUKnightLab/sql-mysteries/contents/\")",
+      "Bash(curl -sL \"https://api.github.com/repos/NUKnightLab/sql-mysteries\")",
+      "Bash(curl -sL \"https://api.github.com/repos/NUKnightLab/sql-mysteries/contents/scripts\")",
+      "Bash(curl -sL -o walkthrough.html \"https://raw.githubusercontent.com/NUKnightLab/sql-mysteries/master/walkthrough.html\")",
+      "Bash(curl -sL -o index.html \"https://raw.githubusercontent.com/NUKnightLab/sql-mysteries/master/index.html\")",
+      "Bash(curl -sL -o README.md \"https://raw.githubusercontent.com/NUKnightLab/sql-mysteries/master/README.md\")",
+      "Bash(curl -sL -o sql-murder-mystery.db \"https://raw.githubusercontent.com/NUKnightLab/sql-mysteries/master/sql-murder-mystery.db\")",
+      "Bash(python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(npm --version)",
+      "Bash(curl -sL -o sql-asm.js \"https://cdn.jsdelivr.net/npm/sql.js@1.13.0/dist/sql-asm.js\" -w \"sql-asm %{http_code} %{size_download}\\\\n\")",
+      "Bash(curl -sL -o cm.js \"https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.js\" -w \"cm %{http_code} %{size_download}\\\\n\")",
+      "Bash(curl -sL -o cm.css \"https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.css\" -w \"cmcss %{http_code} %{size_download}\\\\n\")",
+      "Bash(curl -sL -o cmsql.js \"https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/sql/sql.js\" -w \"cmsql %{http_code} %{size_download}\\\\n\")",
+      "Bash(mkdir -p vendor js css tools data)",
+      "Bash(cp __TRACKED_VAR__/sql-asm.js vendor/sql-asm.js)",
+      "Bash(cp __TRACKED_VAR__/cm.js vendor/codemirror.js)",
+      "Bash(cp __TRACKED_VAR__/cm.css vendor/codemirror.css)",
+      "Bash(cp __TRACKED_VAR__/cmsql.js vendor/codemirror-sql.js)",
+      "Bash(node -e ' *)",
+      "Bash(node *)"
+    ]
+  }
+}
